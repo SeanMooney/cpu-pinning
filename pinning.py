@@ -1,5 +1,4 @@
 from itertools import combinations, chain
-#from six.itertools import combinations
 from six.moves import filter as ifilter
 from operator import xor
 import copy
@@ -44,15 +43,9 @@ def filter_siblings(allocations):
         else:
             yield allocation
 
-def yield_threads(topology):
-    for socket in topology:
-        for node in socket["nodes"]:
-            for cpu in node["pCPUs"]:
-                for thread in cpu["threads"]:
-                    yield thread
 
 def caclulate_effective_request(request):
-    #vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated", "hw:cpu_thread_policy":"isolate"}
+    # vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated", "hw:cpu_thread_policy":"isolate"}
     result = copy.deepcopy(request)
 
     if result.get("hw:cpu_policy") and not result.get("hw:numa_nodes"):
@@ -102,20 +95,91 @@ def filter_numa_nodes_count(allocations, vm_request):
         else:
             yield allocation
 
+def yield_threads_from_numa_nodes(nodes):
+    for node in nodes:
+        for cpu in node["pCPUs"]:
+            for thread in cpu["threads"]:
+                yield thread
+
+def yield_numa_nodes_from_topology(topology):
+    for socket in topology:
+        for node in socket["nodes"]:
+            yield node
+
+def yield_threads_from_topology(topology):
+    nodes = yield_numa_nodes_from_topology(topology)
+    threads = yield_threads_from_numa_nodes(nodes)
+    for thread in threads:
+        yield thread
+
+
+#TODO merge with filter unique numa_nodes via a key fuction.
+def filter_unique_thread(threads):
+    seen = set()
+    for thread in threads:
+        tid = thread["cpu_id"]
+        if tid in seen:
+            continue
+        else:
+            seen.add(tid)
+            yield thread
+
+def filter_unique_numa_node(nodes):
+    seen = set()
+    for node in nodes:
+        nid = node["numa_id"]
+        if nid in seen:
+            continue
+        else:
+            seen.add(nid)
+            yield node
+
+def yield_threads_from_numa_sets(numa_sets):
+    for numa_set in numa_sets:
+        iterators = [yield_threads_from_numa_nodes([node]) for node in numa_set]
+        try:
+            while True:
+                for it in iterators:
+                    yield next(it)
+        except StopIteration:
+            pass
+
 def allocate_cpus(vm_request, topology):
     # first create a generator of all free cpus
-    free_cpus = filter_available_cpus(yield_threads(topology)) 
-    # then lazily generate all posible combinations of
-    # cpu assignmnet for the vm
-    options = combinations(free_cpus, vm_request["vCPUs"])
+    all_numa_nodes = yield_numa_nodes_from_topology(topology)
+    all_threads = yield_threads_from_numa_nodes(all_numa_nodes)
+
+    # determin if the vm requested a numa topology
+    requsted_numa_nodes = vm_request.get("hw:numa_nodes")
+    if requsted_numa_nodes:
+        # if it did, calulate the combinations of numa nodes
+        # the cpus could be allocated from
+        numa_sets = combinations(all_numa_nodes,requsted_numa_nodes)
+        # then yeild the threads in lockstep order striping
+        # each suchsessive thread across numa nodes.
+        all_threads = yield_threads_from_numa_sets(numa_sets)
+
     
-    # then elimiate all allocations that provide the correct number
-    # of numa nodes.
+    # get the unique free threads
+    unique_threads = filter_unique_thread(all_threads)
+    free_threads = filter_available_cpus(unique_threads)
+    # generate the set of X choose Y combinaiont of possible
+    # cpu pinnings
+    options = combinations(free_threads, vm_request["vCPUs"])
+
+    # at this point no iterations have happend. all methods
+    # invoked are generators so actul computation will happen
+    # lazily as the optios are evalated.
+
+    # elimiate all allocations that provide the correct number
+    # of numa nodes. Note this should not be needed anymore.
     options = filter_numa_nodes_count(options,vm_request)
 
     allocation = None
     isolate =  vm_request.get("hw:cpu_thread_policy") == "isolate"
     if isolate:
+        # fileter out all allocations that that self
+        # overlap with thread siblings.
         options = filter_siblings(options)
         allocation = next(options)
         while(allocation):
