@@ -144,6 +144,17 @@ def yield_threads_from_numa_sets(numa_sets):
         except StopIteration:
             pass
 
+def filter_unique_siblings(threads):
+    seen = set()
+    for thread in threads:
+        tid = thread["cpu_id"]
+        if tid in seen:
+            continue
+        else:
+            seen.update(thread["siblings"])
+            yield thread
+
+
 def allocate_cpus(vm_request, topology):
     # first create a generator of all free cpus
     all_numa_nodes = yield_numa_nodes_from_topology(topology)
@@ -165,6 +176,9 @@ def allocate_cpus(vm_request, topology):
     free_threads = filter_available_cpus(unique_threads)
     # generate the set of X choose Y combinaiont of possible
     # cpu pinnings
+    isolate =  vm_request.get("hw:cpu_thread_policy") == "isolate"
+    if isolate:
+        free_threads = filter_unique_siblings(free_threads)
     options = combinations(free_threads, vm_request["vCPUs"])
 
     # at this point no iterations have happend. all methods
@@ -176,10 +190,11 @@ def allocate_cpus(vm_request, topology):
     options = filter_numa_nodes_count(options,vm_request)
 
     allocation = None
-    isolate =  vm_request.get("hw:cpu_thread_policy") == "isolate"
     if isolate:
         # fileter out all allocations that that self
         # overlap with thread siblings.
+        # note this step can now be skiped as we filter
+        # out siblings before computeing options.
         options = filter_siblings(options)
         allocation = next(options)
         while(allocation):
@@ -194,11 +209,11 @@ def allocate_cpus(vm_request, topology):
     return allocation
 
 
-# emulate dual socket ivybdrive host 2 10Core cpus with cluster on die and hyperthreading on
-host_sockets = 2 
-host_numa_nodes_per_socket = 2
-host_cpus_per_socket = 10
-host_threads_per_cpu = 2 
+# emulate a stupidly large system with 4096 threads to make this proablem harder.
+host_sockets = 16
+host_numa_nodes_per_socket = 4
+host_cpus_per_socket = 64
+host_threads_per_cpu = 4
 
 topology = generate_numa_topology(sockets=host_sockets, numa_nodes=host_numa_nodes_per_socket,
     cpus = host_cpus_per_socket, threads=host_threads_per_cpu)
