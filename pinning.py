@@ -209,11 +209,11 @@ def allocate_cpus(vm_request, topology):
     return allocation
 
 
-# emulate a stupidly large system with 4096 threads to make this proablem harder.
-host_sockets = 16
-host_numa_nodes_per_socket = 4
+# emulate a very large system with 512 threads to make this proablem harder.
+host_sockets = 4
+host_numa_nodes_per_socket = 2
 host_cpus_per_socket = 64
-host_threads_per_cpu = 4
+host_threads_per_cpu = 2
 
 topology = generate_numa_topology(sockets=host_sockets, numa_nodes=host_numa_nodes_per_socket,
     cpus = host_cpus_per_socket, threads=host_threads_per_cpu)
