@@ -4,7 +4,14 @@ from operator import xor
 import copy
 import math
 
-def generate_numa_topology(sockets=2, numa_nodes=2, cpus = 4, threads=2):
+default_mempages = {
+    "4k":int(10240*1024/4), # 10G
+    "2M":512*10, # 10G
+    "1G":12, # 12G
+} # 32G
+
+def generate_numa_topology(sockets=2, numa_nodes=2, cpus = 4, threads=2,
+                           default_mempage=default_mempages, mempages={}):
     topology = []
     for s in range(sockets):
         socket = { "id":s, "nodes":[]}
@@ -12,6 +19,8 @@ def generate_numa_topology(sockets=2, numa_nodes=2, cpus = 4, threads=2):
         for n in range(numa_nodes):
             numa_id = s*numa_nodes + n
             node = { "id":n, "numa_id": numa_id, "pCPUs":[], "parent": socket}
+            pages = mempages.get(numa_id) or default_mempage
+            node["mempages"] = copy.deepcopy(pages)
             socket["nodes"].append(node)
             cores_per_node = cpus//numa_nodes
             for c in range(cores_per_node):
@@ -80,17 +89,6 @@ def can_isolate(allocation):
                     return False
         return True
         
-def claim_cpus(cpus, claim_siblings=False):
-    if not claim_siblings:
-        for cpu in cpus:
-            cpu["used"]=True
-    else:
-        parents = {}
-        for cpu in cpus:
-            parent = cpu["parent"]
-            parents[parent["pcpu_id"]] = parent
-        for parent in parents.values():
-            claim_cpus(parent["threads"])
 
 def filter_numa_nodes_count(allocations, vm_request):
     if not vm_request.get("hw:numa_nodes"):
@@ -143,6 +141,22 @@ def filter_unique_numa_node(nodes):
         else:
             seen.add(nid)
             yield node
+
+def filter_numa_sets_by_mempages(numa_sets, vm_request):
+    memory_mb = vm_request["memory_mb"]
+    pagesize = vm_request["hw:mem_page_size"]
+    requested_nodes = vm_request["hw:numa_nodes"]
+    pagesize_multiplier =  1024/4 if pagesize == "4k" else 1/2 if pagesize == "2M" else 1/1024
+    pages = memory_mb * pagesize_multiplier
+    ram_per_node = int(pages // requested_nodes)
+    if pagesize == "1G":
+        pass
+    for numa_set in numa_sets:
+        for node in numa_set:
+            if node["mempages"][pagesize] < ram_per_node:
+                break
+        else:
+            yield numa_set
 
 def yield_threads_from_numa_sets(numa_sets):
     for numa_set in numa_sets:
@@ -207,7 +221,39 @@ def group_threads_by_required_siblings(threads, vm_request, host_threads_per_cpu
         except IndexError:
             pass
 
-def allocate_cpus(vm_request, topology,thread_dict):
+def claim_cpus(cpus, claim_siblings=False):
+    if not claim_siblings:
+        for cpu in cpus:
+            cpu["used"]=True
+    else:
+        parents = {}
+        for cpu in cpus:
+            parent = cpu["parent"]
+            parents[parent["pcpu_id"]] = parent
+        for parent in parents.values():
+            claim_cpus(parent["threads"])
+
+def claim_mempages(cpus, vm_request):
+    nodes = {}
+    memory_mb = vm_request["memory_mb"]
+    pagesize = vm_request["hw:mem_page_size"]
+    requested_nodes = vm_request["hw:numa_nodes"]
+    pagesize_multiplier =  1024/4 if pagesize == "4k" else 1/2 if pagesize == "2M" else 1/1024
+    pages = memory_mb * pagesize_multiplier
+    pages_per_node = int(pages // requested_nodes)
+
+    for cpu in cpus:
+        numa_id = cpu["numa"]
+        if numa_id  not in nodes:
+            nodes[numa_id] = cpu["parent"]["parent"]
+    mempage_allocation = {}
+    for node in nodes.values():
+        node["mempages"][pagesize] -= pages_per_node
+        mempage_allocation[node["numa_id"]] = {"node":node, "pagesize":pagesize,
+            "count":pages_per_node}
+    return mempage_allocation
+
+def allocate(vm_request, topology,thread_dict):
     # first create a generator of all free cpus
     all_numa_nodes = yield_numa_nodes_from_topology(topology)
     all_threads = yield_threads_from_numa_nodes(all_numa_nodes)
@@ -218,6 +264,7 @@ def allocate_cpus(vm_request, topology,thread_dict):
         # if it did, calulate the combinations of numa nodes
         # the cpus could be allocated from
         numa_sets = combinations(all_numa_nodes,requsted_numa_nodes)
+        numa_sets = filter_numa_sets_by_mempages(numa_sets,vm_request)
         # then yeild the threads in lockstep order striping
         # each suchsessive thread across numa nodes.
         all_threads = yield_threads_from_numa_sets(numa_sets)
@@ -268,13 +315,15 @@ def allocate_cpus(vm_request, topology,thread_dict):
     else:
         allocation = next(options)
 
+    allocation_dict = {"cpus":allocation}
     if allocation:
-        claim_cpus(allocation,claim_siblings=isolate)
-    return allocation
+        claim_cpus(allocation, claim_siblings=isolate)
+        allocation_dict["mempages"] = claim_mempages(allocation, vm_request)
+    return allocation_dict
 
 
 # emulate a very large system with 512 threads to make this proablem harder.
-host_sockets = 16
+host_sockets = 4
 host_numa_nodes_per_socket = 2
 host_cpus_per_socket = 64
 host_threads_per_cpu = 8
@@ -285,62 +334,48 @@ topology = generate_numa_topology(sockets=host_sockets, numa_nodes=host_numa_nod
 thread_dict = { thread["cpu_id"]:thread for thread in yield_threads_from_topology(topology)}
 # vm with 4 cores spead on 4 numa nodes explcitly
 vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated", 
-              "hw:cpu_thread_policy":"isolate",
-              "hw:numa_nodes":4}
-effective_request = caclulate_effective_request(vm_request)
-allocation = allocate_cpus(effective_request,topology,thread_dict)
-if allocation:
-    mapping = ",".join( "%s:%s" % (vcpu,pcpu["cpu_id"]) for vcpu, pcpu in  enumerate(allocation))
-    print(mapping)
-else:
-    print("pinning failed")
+              "hw:cpu_thread_policy":"isolate", "hw:numa_nodes":4,
+              "memory_mb":40960, "hw:mem_page_size": "1G"}
+
+def allocate_for_instance(vm_request, topology):
+    effective_request = caclulate_effective_request(vm_request)
+    allocation = allocate(effective_request,topology,thread_dict)
+    if allocation:
+        mapping = ",".join( "%s:%s" % (vcpu,pcpu["cpu_id"]) for vcpu, pcpu in  enumerate(allocation["cpus"]))
+        print(mapping)
+    else:
+        print("pinning failed")
+    return allocation
+
+allocation= allocate_for_instance(vm_request,  topology)
 
 # this is a vm with 4 cores an an implcit virtual numa topology of 1 numa node
 vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated", 
-              "hw:cpu_thread_policy":"isolate"}
-effective_request = caclulate_effective_request(vm_request)
-allocation = allocate_cpus(effective_request,topology,thread_dict)
-if allocation:
-    mapping = ",".join( "%s:%s" % (vcpu,pcpu["cpu_id"]) for vcpu, pcpu in  enumerate(allocation))
-    print(mapping)
-else:
-    print("pinning failed")
+              "hw:cpu_thread_policy":"isolate",
+              "memory_mb":1024, "hw:mem_page_size": "1G"}
+allocation = allocate_for_instance(vm_request,  topology)
+
 
 # a 4 core v with 1 implicit numa node and no thread isolation
-vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated"}
-effective_request = caclulate_effective_request(vm_request)
-allocation = allocate_cpus(effective_request,topology,thread_dict)
-if allocation:
-    mapping = ",".join( "%s:%s" % (vcpu,pcpu["cpu_id"]) for vcpu, pcpu in  enumerate(allocation))
-    print(mapping)
-else:
-    print("pinning failed")
+vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated",
+              "memory_mb":1024, "hw:mem_page_size": "1G"}
+allocation = allocate_for_instance(vm_request,  topology)
 
 # a 8 core vm with 3 numa nodes and isolated threads.
 vm_request = {"vCPUs":8,"hw:cpu_policy":"dedicated", 
               "hw:cpu_thread_policy":"isolate",
-              "hw:numa_nodes":3}
-effective_request = caclulate_effective_request(vm_request)
-allocation = allocate_cpus(effective_request,topology,thread_dict)
-if allocation:
-    mapping = ",".join( "%s:%s" % (vcpu,pcpu["cpu_id"]) for vcpu, pcpu in  enumerate(allocation))
-    print(mapping)
-else:
-    print("pinning failed")
+              "hw:numa_nodes":3,
+              "memory_mb":1024, "hw:mem_page_size": "4k"}
+allocation = allocate_for_instance(vm_request,  topology)
 
 # a 8 core vm with 3 numa nodes and isolated threads.
 vm_request = {"vCPUs":8,"hw:cpu_policy":"dedicated",
               "hw:cpu_thread_policy":"require",
-              "hw:numa_nodes":2}
-effective_request = caclulate_effective_request(vm_request)
-allocation = allocate_cpus(effective_request,topology,thread_dict)
-if allocation:
-    mapping = ",".join( "%s:%s" % (vcpu,pcpu["cpu_id"]) for vcpu, pcpu in  enumerate(allocation))
-    print(mapping)
-else:
-    print("pinning failed")
+              "hw:numa_nodes":2,
+              "memory_mb":1024, "hw:mem_page_size": "4k"}
+allocation = allocate_for_instance(vm_request,  topology)
 
 import pprint
 printer = pprint.PrettyPrinter(indent=4, width=150)
 # this is big so dont print by default
-#printer.pprint(topology)
+# printer.pprint(topology)
