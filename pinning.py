@@ -2,9 +2,10 @@ from itertools import combinations, chain
 from six.moves import filter as ifilter
 from operator import xor
 import copy
+import math
 
 def generate_numa_topology(sockets=2, numa_nodes=2, cpus = 4, threads=2):
-    topology = list()
+    topology = []
     for s in range(sockets):
         socket = { "id":s, "nodes":[]}
         topology.append(socket)
@@ -43,6 +44,15 @@ def filter_siblings(allocations):
         else:
             yield allocation
 
+def filter_require_free_siblings(threads, thread_dict):
+    valid = set()
+    for thread in threads:
+        siblings = thread["siblings"]
+        if thread["cpu_id"] in valid:
+            yield thread
+        elif all( thread_dict[sibling]["used"] == False for sibling in siblings):
+            valid.update(siblings)
+            yield thread
 
 def caclulate_effective_request(request):
     # vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated", "hw:cpu_thread_policy":"isolate"}
@@ -155,7 +165,49 @@ def filter_unique_siblings(threads):
             yield thread
 
 
-def allocate_cpus(vm_request, topology):
+def can_require_siblings(allocation,vm_request, host_threads_per_cpu):
+        vcpus = vm_request["vCPUs"]
+        requested_nodes = vm_request.get("hw:numa_nodes",1)
+        cpus_per_node =math.ceil(vcpus/requested_nodes)
+        expected_count = requested_nodes
+        if host_threads_per_cpu < cpus_per_node:
+            expected_count = math.ceil(vcpus / host_threads_per_cpu)
+        partents = {cpu["parent"]["pcpu_id"] for cpu in allocation}
+        if  cpus_per_node % host_threads_per_cpu == 0:
+            return len(partents) == expected_count
+        elif math.ceil(vcpus/requested_nodes) < host_threads_per_cpu:
+            return len(partents) <= expected_count
+        else:
+            return len(partents) <= expected_count + requested_nodes
+
+
+
+def group_threads_by_required_siblings(threads, vm_request, host_threads_per_cpu):
+    nodes = {}
+    vcpus = vm_request["vCPUs"]
+    requested_nodes = vm_request.get("hw:numa_nodes",1)
+    cpus_per_node =math.ceil(vcpus/requested_nodes)
+    for thread in threads:
+        nodes.setdefault(thread["numa"],[]).append(thread)
+    requested_nodes = vm_request["hw:numa_nodes"]
+    while nodes:
+        current_nodes = []
+        for _ in range(requested_nodes):
+            node = nodes.popitem()[1]
+            current_nodes.append(node)
+        try:
+            while True:
+                for node_threads in current_nodes:
+                    for _ in range(cpus_per_node):
+                        yield node_threads.pop()
+                    if cpus_per_node % host_threads_per_cpu != 0:
+                        for _ in range(host_threads_per_cpu -
+                            (cpus_per_node % host_threads_per_cpu)):
+                            node_threads.pop()
+        except IndexError:
+            pass
+
+def allocate_cpus(vm_request, topology,thread_dict):
     # first create a generator of all free cpus
     all_numa_nodes = yield_numa_nodes_from_topology(topology)
     all_threads = yield_threads_from_numa_nodes(all_numa_nodes)
@@ -174,11 +226,17 @@ def allocate_cpus(vm_request, topology):
     # get the unique free threads
     unique_threads = filter_unique_thread(all_threads)
     free_threads = filter_available_cpus(unique_threads)
-    # generate the set of X choose Y combinaiont of possible
-    # cpu pinnings
     isolate =  vm_request.get("hw:cpu_thread_policy") == "isolate"
     if isolate:
         free_threads = filter_unique_siblings(free_threads)
+    require =  vm_request.get("hw:cpu_thread_policy") == "require"
+    if require:
+        free_threads = filter_require_free_siblings(free_threads, thread_dict)
+        free_threads = group_threads_by_required_siblings(free_threads,
+            vm_request, host_threads_per_cpu)
+        # free_threads = list(free_threads)
+    # generate the set of X choose Y combinaiont of possible
+    # cpu pinnings
     options = combinations(free_threads, vm_request["vCPUs"])
 
     # at this point no iterations have happend. all methods
@@ -201,6 +259,12 @@ def allocate_cpus(vm_request, topology):
             if can_isolate(allocation):
                 break
             allocation = next(options)
+    elif require:
+        allocation = next(options)
+        while(allocation):
+            if can_require_siblings(allocation, vm_request, host_threads_per_cpu):
+                break
+            allocation = next(options)
     else:
         allocation = next(options)
 
@@ -210,20 +274,21 @@ def allocate_cpus(vm_request, topology):
 
 
 # emulate a very large system with 512 threads to make this proablem harder.
-host_sockets = 4
+host_sockets = 16
 host_numa_nodes_per_socket = 2
 host_cpus_per_socket = 64
-host_threads_per_cpu = 2
+host_threads_per_cpu = 8
 
 topology = generate_numa_topology(sockets=host_sockets, numa_nodes=host_numa_nodes_per_socket,
     cpus = host_cpus_per_socket, threads=host_threads_per_cpu)
 
+thread_dict = { thread["cpu_id"]:thread for thread in yield_threads_from_topology(topology)}
 # vm with 4 cores spead on 4 numa nodes explcitly
 vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated", 
               "hw:cpu_thread_policy":"isolate",
               "hw:numa_nodes":4}
 effective_request = caclulate_effective_request(vm_request)
-allocation = allocate_cpus(effective_request,topology)
+allocation = allocate_cpus(effective_request,topology,thread_dict)
 if allocation:
     mapping = ",".join( "%s:%s" % (vcpu,pcpu["cpu_id"]) for vcpu, pcpu in  enumerate(allocation))
     print(mapping)
@@ -234,7 +299,7 @@ else:
 vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated", 
               "hw:cpu_thread_policy":"isolate"}
 effective_request = caclulate_effective_request(vm_request)
-allocation = allocate_cpus(effective_request,topology)
+allocation = allocate_cpus(effective_request,topology,thread_dict)
 if allocation:
     mapping = ",".join( "%s:%s" % (vcpu,pcpu["cpu_id"]) for vcpu, pcpu in  enumerate(allocation))
     print(mapping)
@@ -244,7 +309,7 @@ else:
 # a 4 core v with 1 implicit numa node and no thread isolation
 vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated"}
 effective_request = caclulate_effective_request(vm_request)
-allocation = allocate_cpus(effective_request,topology)
+allocation = allocate_cpus(effective_request,topology,thread_dict)
 if allocation:
     mapping = ",".join( "%s:%s" % (vcpu,pcpu["cpu_id"]) for vcpu, pcpu in  enumerate(allocation))
     print(mapping)
@@ -256,13 +321,24 @@ vm_request = {"vCPUs":8,"hw:cpu_policy":"dedicated",
               "hw:cpu_thread_policy":"isolate",
               "hw:numa_nodes":3}
 effective_request = caclulate_effective_request(vm_request)
-allocation = allocate_cpus(effective_request,topology)
+allocation = allocate_cpus(effective_request,topology,thread_dict)
 if allocation:
     mapping = ",".join( "%s:%s" % (vcpu,pcpu["cpu_id"]) for vcpu, pcpu in  enumerate(allocation))
     print(mapping)
 else:
     print("pinning failed")
 
+# a 8 core vm with 3 numa nodes and isolated threads.
+vm_request = {"vCPUs":8,"hw:cpu_policy":"dedicated",
+              "hw:cpu_thread_policy":"require",
+              "hw:numa_nodes":2}
+effective_request = caclulate_effective_request(vm_request)
+allocation = allocate_cpus(effective_request,topology,thread_dict)
+if allocation:
+    mapping = ",".join( "%s:%s" % (vcpu,pcpu["cpu_id"]) for vcpu, pcpu in  enumerate(allocation))
+    print(mapping)
+else:
+    print("pinning failed")
 
 import pprint
 printer = pprint.PrettyPrinter(indent=4, width=150)
