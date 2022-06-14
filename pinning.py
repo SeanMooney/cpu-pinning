@@ -333,7 +333,7 @@ topology = generate_numa_topology(sockets=host_sockets, numa_nodes=host_numa_nod
 
 thread_dict = { thread["cpu_id"]:thread for thread in yield_threads_from_topology(topology)}
 # vm with 4 cores spead on 4 numa nodes explcitly
-vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated", 
+vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated",
               "hw:cpu_thread_policy":"isolate", "hw:numa_nodes":4,
               "memory_mb":40960, "hw:mem_page_size": "1G"}
 
@@ -347,22 +347,22 @@ def allocate_for_instance(vm_request, topology):
         print("pinning failed")
     return allocation
 
-allocation= allocate_for_instance(vm_request,  topology)
+#allocation= allocate_for_instance(vm_request,  topology)
 
 # this is a vm with 4 cores an an implcit virtual numa topology of 1 numa node
-vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated", 
+vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated",
               "hw:cpu_thread_policy":"isolate",
               "memory_mb":1024, "hw:mem_page_size": "1G"}
-allocation = allocate_for_instance(vm_request,  topology)
+#allocation = allocate_for_instance(vm_request,  topology)
 
 
 # a 4 core v with 1 implicit numa node and no thread isolation
 vm_request = {"vCPUs":4,"hw:cpu_policy":"dedicated",
               "memory_mb":1024, "hw:mem_page_size": "1G"}
-allocation = allocate_for_instance(vm_request,  topology)
+#allocation = allocate_for_instance(vm_request,  topology)
 
 # a 8 core vm with 3 numa nodes and isolated threads.
-vm_request = {"vCPUs":8,"hw:cpu_policy":"dedicated", 
+vm_request = {"vCPUs":8,"hw:cpu_policy":"dedicated",
               "hw:cpu_thread_policy":"isolate",
               "hw:numa_nodes":3,
               "memory_mb":1024, "hw:mem_page_size": "4k"}
@@ -373,6 +373,34 @@ vm_request = {"vCPUs":8,"hw:cpu_policy":"dedicated",
               "hw:cpu_thread_policy":"require",
               "hw:numa_nodes":2,
               "memory_mb":1024, "hw:mem_page_size": "4k"}
+#allocation = allocate_for_instance(vm_request,  topology)
+
+print("bug repoducer")
+print("----------------------------------------")
+
+# emulate upstream bug
+host_sockets = 1
+host_numa_nodes_per_socket = 16
+host_cpus_per_socket = 48
+host_threads_per_cpu = 2
+
+default_mempages = {
+    "1G":61,
+} # 32G
+
+topology = generate_numa_topology(
+    sockets=host_sockets, numa_nodes=host_numa_nodes_per_socket,
+    cpus=host_cpus_per_socket, threads=host_threads_per_cpu,
+    default_mempage=default_mempages
+
+)
+
+thread_dict = { thread["cpu_id"]:thread for thread in yield_threads_from_topology(topology)}
+# vm with 4 cores spead on 4 numa nodes explcitly
+vm_request = {"vCPUs":48,"hw:cpu_policy":"dedicated", 
+              "hw:cpu_thread_policy":"prefer", "hw:numa_nodes":8,
+              "memory_mb":488*1024, "hw:mem_page_size": "1G"}
+
 allocation = allocate_for_instance(vm_request,  topology)
 
 import pprint
