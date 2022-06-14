@@ -366,7 +366,7 @@ vm_request = {"vCPUs":8,"hw:cpu_policy":"dedicated",
               "hw:cpu_thread_policy":"isolate",
               "hw:numa_nodes":3,
               "memory_mb":1024, "hw:mem_page_size": "4k"}
-allocation = allocate_for_instance(vm_request,  topology)
+#allocation = allocate_for_instance(vm_request,  topology)
 
 # a 8 core vm with 3 numa nodes and isolated threads.
 vm_request = {"vCPUs":8,"hw:cpu_policy":"dedicated",
@@ -377,6 +377,10 @@ vm_request = {"vCPUs":8,"hw:cpu_policy":"dedicated",
 
 print("bug repoducer")
 print("----------------------------------------")
+import pprint
+printer = pprint.PrettyPrinter(indent=4, width=150)
+# this is big so dont print by default
+# printer.pprint(topology)
 
 # emulate upstream bug
 host_sockets = 1
@@ -395,6 +399,13 @@ topology = generate_numa_topology(
 
 )
 
+#fully use the first 7 numa nodes.
+for i in range(7):
+    node = topology[0]['nodes'][i]
+    for cpu in node['pCPUs']:
+        for thread in cpu['threads']:
+            thread['used'] = True
+
 thread_dict = { thread["cpu_id"]:thread for thread in yield_threads_from_topology(topology)}
 # vm with 4 cores spead on 4 numa nodes explcitly
 vm_request = {"vCPUs":48,"hw:cpu_policy":"dedicated", 
@@ -403,7 +414,4 @@ vm_request = {"vCPUs":48,"hw:cpu_policy":"dedicated",
 
 allocation = allocate_for_instance(vm_request,  topology)
 
-import pprint
-printer = pprint.PrettyPrinter(indent=4, width=150)
-# this is big so dont print by default
-# printer.pprint(topology)
+
